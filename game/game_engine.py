@@ -1,6 +1,9 @@
+import math
+
 import pygame
 from .marble import Marble
 from .wall import Wall
+from .sounds import SoundManager
 
 # Game Engine
 
@@ -8,27 +11,78 @@ WHITE = (255, 255, 255)
 DARK = (40, 40, 50)
 WALL_COLOR = (90, 90, 110)
 GOAL_COLOR = (60, 200, 120)
+LOSE_COLOR = (230, 90, 90)
+PANEL_COLOR = (30, 30, 42)
+PANEL_BORDER = (110, 110, 140)
+BUTTON_COLOR = (70, 70, 95)
+BUTTON_HOVER = (105, 105, 145)
+BUTTON_DISABLED = (50, 50, 62)
+TEXT_DIM = (170, 170, 190)
+
+# Medium matches the original game's settings.
+DIFFICULTIES = {
+    "easy":   {"label": "Easy",   "tilt_strength": 0.5, "friction": 0.04,  "time_limit_ms": 60000},
+    "medium": {"label": "Medium", "tilt_strength": 0.6, "friction": 0.02,  "time_limit_ms": 45000},
+    "hard":   {"label": "Hard",   "tilt_strength": 0.8, "friction": 0.008, "time_limit_ms": 30000},
+}
+
+KEY_ACTIONS = {
+    pygame.K_1: "easy", pygame.K_KP1: "easy", pygame.K_e: "easy",
+    pygame.K_2: "medium", pygame.K_KP2: "medium", pygame.K_m: "medium",
+    pygame.K_3: "hard", pygame.K_KP3: "hard", pygame.K_h: "hard",
+    pygame.K_ESCAPE: "exit", pygame.K_q: "exit",
+}
+
+START_POS = (50, 50)
+WALL_RESTITUTION = 0.3          # fraction of speed kept (reversed) after a bounce
+BOUNCE_SOUND_MIN_IMPACT = 1.5   # ignore tiny contacts (e.g. resting against a wall)
+END_INPUT_DELAY_MS = 500        # avoids skipping the end screen by accident
+
 
 class GameEngine:
     def __init__(self, width, height):
         self.width = width
         self.height = height
 
-        self.marble = Marble(50, 50)
-        self.tilt_strength = 0.6
-        self.friction = 0.02
         self.max_speed = 9
 
         self.walls = self._build_maze()
         self.goal_x, self.goal_y, self.goal_radius = width - 60, height - 60, 22
 
-        self.time_limit_ms = 45000
-        self.start_ticks = pygame.time.get_ticks()
-
         self.font = pygame.font.SysFont("Arial", 26)
+        self.title_font = pygame.font.SysFont("Arial", 48, bold=True)
+        self.small_font = pygame.font.SysFont("Arial", 20)
+
+        self.sounds = SoundManager()
+
+        self._build_end_screen_layout()
+
+        self.marble = Marble(*START_POS)
+        self.difficulty = "medium"
+        self.reset(self.difficulty)
+
+    # ------------------------------------------------------------------
+    # Setup / reset
+    # ------------------------------------------------------------------
+
+    def reset(self, difficulty=None):
+        """Start a fresh round, optionally switching difficulty."""
+        if difficulty is not None:
+            self.difficulty = difficulty
+        settings = DIFFICULTIES[self.difficulty]
+
+        self.tilt_strength = settings["tilt_strength"]
+        self.friction = settings["friction"]
+        self.time_limit_ms = settings["time_limit_ms"]
+
+        self.marble.reset(*START_POS)
+
+        self.start_ticks = pygame.time.get_ticks()
+        self.elapsed_ms = 0
         self.game_over = False
         self.result = None  # "solved" or "timeout"
         self.finish_time_ms = None
+        self.game_over_ticks = 0
 
     def _build_maze(self):
         walls = []
@@ -47,10 +101,56 @@ class GameEngine:
 
         return walls
 
+    def _build_end_screen_layout(self):
+        panel_w, panel_h = 460, 320
+        self.panel_rect = pygame.Rect(0, 0, panel_w, panel_h)
+        self.panel_rect.center = (self.width // 2, self.height // 2)
+
+        self.overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        self.overlay.fill((0, 0, 0, 170))
+
+        btn_w, btn_h, gap = 130, 64, 15
+        total = 3 * btn_w + 2 * gap
+        x = self.panel_rect.centerx - total // 2
+        y = self.panel_rect.y + 190
+
+        self.buttons = {}
+        for name in ("easy", "medium", "hard"):
+            self.buttons[name] = pygame.Rect(x, y, btn_w, btn_h)
+            x += btn_w + gap
+
+        exit_rect = pygame.Rect(0, 0, 200, 40)
+        exit_rect.midtop = (self.panel_rect.centerx, y + btn_h + 12)
+        self.buttons["exit"] = exit_rect
+
+    # ------------------------------------------------------------------
+    # Input
+    # ------------------------------------------------------------------
+
+    def _end_screen_active(self):
+        return (self.game_over and
+                pygame.time.get_ticks() - self.game_over_ticks >= END_INPUT_DELAY_MS)
+
     def handle_event(self, event):
-        # This game is driven entirely by the continuous mouse
-        # position, handled in handle_input each frame.
-        pass
+        # Gameplay is driven by the continuous mouse position (see
+        # handle_input). Events only matter on the end screen.
+        if not self._end_screen_active():
+            return None
+
+        action = None
+        if event.type == pygame.KEYDOWN:
+            action = KEY_ACTIONS.get(event.key)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for name, rect in self.buttons.items():
+                if rect.collidepoint(event.pos):
+                    action = name
+                    break
+
+        if action == "exit":
+            return "QUIT"
+        if action in DIFFICULTIES:
+            self.reset(action)
+        return None
 
     def handle_input(self):
         if self.game_over:
@@ -65,15 +165,30 @@ class GameEngine:
         self.marble.vx += ax
         self.marble.vy += ay
 
+    # ------------------------------------------------------------------
+    # Update
+    # ------------------------------------------------------------------
+
+    def _end_round(self, result):
+        self.game_over = True
+        self.result = result
+        self.game_over_ticks = pygame.time.get_ticks()
+        if result == "solved":
+            self.finish_time_ms = self.elapsed_ms
+            self.sounds.play_goal()
+        else:
+            self.sounds.play_timeout()
+
     def update(self):
         if self.game_over:
-            return
+            return None
 
         elapsed = pygame.time.get_ticks() - self.start_ticks
         if elapsed >= self.time_limit_ms:
-            self.game_over = True
-            self.result = "timeout"
-            return
+            self.elapsed_ms = self.time_limit_ms
+            self._end_round("timeout")
+            return None
+        self.elapsed_ms = elapsed
 
         self.marble.vx *= (1 - self.friction)
         self.marble.vy *= (1 - self.friction)
@@ -92,39 +207,68 @@ class GameEngine:
         gx = self.goal_x - self.marble.x
         gy = self.goal_y - self.marble.y
         if (gx ** 2 + gy ** 2) ** 0.5 <= self.goal_radius:
-            self.game_over = True
-            self.result = "solved"
-            self.finish_time_ms = elapsed
+            self._end_round("solved")
+
+        return None
 
     def _resolve_wall_collisions(self):
+        """Exact circle-vs-rectangle collision.
+
+        For each wall, find the point on the rectangle closest to the
+        marble's centre. The marble touches the wall only if that point is
+        closer than the marble's radius. The marble is pushed out along the
+        contact normal and only the velocity component pointing into the
+        wall is reflected, so near a corner it bounces off the corner
+        itself (not off empty space) and slides naturally along flat sides.
+        """
+        m = self.marble
+        r = m.radius
+        strongest_impact = 0.0
+
         for wall in self.walls:
-            marble_rect = self.marble.rect()
-            wall_rect = wall.rect()
+            cx, cy = wall.closest_point(m.x, m.y)
+            dx = m.x - cx
+            dy = m.y - cy
+            dist_sq = dx * dx + dy * dy
 
-            # NOTE: this checks a simple bounding-box overlap
-            # (colliderect) between the marble's square bounding box
-            # and the wall, instead of a true circle-vs-rectangle
-            # distance test. Near a wall's corner, the marble's
-            # bounding square can overlap the wall rect well before
-            # the actual round marble visually touches it, causing an
-            # early "phantom" bounce off empty space right next to
-            # corners. See Task 1 in the README.
-            if marble_rect.colliderect(wall_rect):
-                overlap_x = min(marble_rect.right, wall_rect.right) - max(marble_rect.left, wall_rect.left)
-                overlap_y = min(marble_rect.bottom, wall_rect.bottom) - max(marble_rect.top, wall_rect.top)
+            if dist_sq >= r * r:
+                continue  # circle does not touch this wall
 
-                if overlap_x < overlap_y:
-                    if self.marble.x < wall_rect.centerx:
-                        self.marble.x -= overlap_x
-                    else:
-                        self.marble.x += overlap_x
-                    self.marble.vx *= -0.3
-                else:
-                    if self.marble.y < wall_rect.centery:
-                        self.marble.y -= overlap_y
-                    else:
-                        self.marble.y += overlap_y
-                    self.marble.vy *= -0.3
+            if dist_sq > 1e-12:
+                dist = math.sqrt(dist_sq)
+                nx, ny = dx / dist, dy / dist
+                penetration = r - dist
+            else:
+                # Centre is inside the wall (e.g. after a very fast move):
+                # leave through the nearest face.
+                faces = [
+                    (m.x - wall.left, -1, 0),
+                    (wall.right - m.x, 1, 0),
+                    (m.y - wall.top, 0, -1),
+                    (wall.bottom - m.y, 0, 1),
+                ]
+                depth, nx, ny = min(faces, key=lambda f: f[0])
+                penetration = depth + r
+
+            m.x += nx * penetration
+            m.y += ny * penetration
+
+            vn = m.vx * nx + m.vy * ny  # velocity along the normal
+            if vn < 0:  # moving into the wall
+                m.vx -= (1 + WALL_RESTITUTION) * vn * nx
+                m.vy -= (1 + WALL_RESTITUTION) * vn * ny
+                strongest_impact = max(strongest_impact, -vn)
+
+        if strongest_impact >= BOUNCE_SOUND_MIN_IMPACT:
+            self.sounds.play_bounce(strongest_impact / self.max_speed)
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
+
+    def _blit_centered(self, surface, text, font, color, center):
+        img = font.render(text, True, color)
+        surface.blit(img, img.get_rect(center=center))
 
     def render(self, screen):
         screen.fill(DARK)
@@ -135,15 +279,55 @@ class GameEngine:
         pygame.draw.circle(screen, GOAL_COLOR, (self.goal_x, self.goal_y), self.goal_radius)
         pygame.draw.circle(screen, WHITE, (int(self.marble.x), int(self.marble.y)), self.marble.radius)
 
-        elapsed = pygame.time.get_ticks() - self.start_ticks
-        seconds_left = max(0, (self.time_limit_ms - elapsed) // 1000)
+        # Timer is always visible; it freezes when the round ends.
+        remaining_ms = max(0, self.time_limit_ms - self.elapsed_ms)
+        seconds_left = (remaining_ms + 999) // 1000
         timer_text = self.font.render(f"Time: {seconds_left}s", True, WHITE)
-        screen.blit(timer_text, (10, 10))
+        screen.blit(timer_text, (24, 24))
 
-        if self.game_over and not getattr(self, "_game_over_logged", False):
-            # NOTE: no proper end screen yet - see Task 2 in the README.
-            if self.result == "solved":
-                print(f"Solved! Finished in {self.finish_time_ms / 1000:.1f}s")
+        if self.game_over:
+            self._render_end_screen(screen)
+
+    def _render_end_screen(self, screen):
+        screen.blit(self.overlay, (0, 0))
+
+        panel = self.panel_rect
+        pygame.draw.rect(screen, PANEL_COLOR, panel, border_radius=12)
+        pygame.draw.rect(screen, PANEL_BORDER, panel, width=2, border_radius=12)
+
+        cx = panel.centerx
+        if self.result == "solved":
+            self._blit_centered(screen, "Maze Solved!", self.title_font, GOAL_COLOR, (cx, panel.y + 45))
+            detail = f"Finished in {self.finish_time_ms / 1000:.1f}s"
+        else:
+            self._blit_centered(screen, "Time's Up!", self.title_font, LOSE_COLOR, (cx, panel.y + 45))
+            detail = "The maze was not solved in time."
+        self._blit_centered(screen, detail, self.font, WHITE, (cx, panel.y + 100))
+
+        label = DIFFICULTIES[self.difficulty]["label"]
+        self._blit_centered(screen, f"Difficulty: {label}", self.small_font, TEXT_DIM, (cx, panel.y + 135))
+        self._blit_centered(screen, "Play again - choose a difficulty:", self.small_font, WHITE,
+                            (cx, panel.y + 168))
+
+        active = self._end_screen_active()
+        mouse_pos = pygame.mouse.get_pos()
+
+        for name, rect in self.buttons.items():
+            if not active:
+                color = BUTTON_DISABLED
+            elif rect.collidepoint(mouse_pos):
+                color = BUTTON_HOVER
             else:
-                print("Time's up! Maze not solved.")
-            self._game_over_logged = True
+                color = BUTTON_COLOR
+            pygame.draw.rect(screen, color, rect, border_radius=8)
+
+            text_color = WHITE if active else TEXT_DIM
+            if name == "exit":
+                self._blit_centered(screen, "[Esc] Exit", self.font, text_color, rect.center)
+            else:
+                info = DIFFICULTIES[name]
+                number = list(DIFFICULTIES).index(name) + 1
+                self._blit_centered(screen, f"[{number}] {info['label']}", self.font, text_color,
+                                    (rect.centerx, rect.y + 24))
+                self._blit_centered(screen, f"{info['time_limit_ms'] // 1000}s", self.small_font,
+                                    TEXT_DIM, (rect.centerx, rect.y + 47))
