@@ -1,9 +1,9 @@
+import array
 import math
 
 import pygame
 from .marble import Marble
 from .wall import Wall
-from .sounds import SoundManager
 
 # Game Engine
 
@@ -37,6 +37,95 @@ START_POS = (50, 50)
 WALL_RESTITUTION = 0.3          # fraction of speed kept (reversed) after a bounce
 BOUNCE_SOUND_MIN_IMPACT = 1.5   # ignore tiny contacts (e.g. resting against a wall)
 END_INPUT_DELAY_MS = 500        # avoids skipping the end screen by accident
+
+
+class SoundManager:
+    """Generates simple sound effects in code (no audio files required).
+
+    If audio is unavailable (no sound device, unsupported mixer format),
+    every play_* method silently does nothing so the game still runs.
+    """
+
+    BOUNCE_COOLDOWN_MS = 60
+
+    def __init__(self):
+        self.enabled = False
+        self.bounce = None
+        self.goal = None
+        self.timeout = None
+        self._last_bounce_ms = -1000
+
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(44100, -16, 1, 512)
+            mixer_state = pygame.mixer.get_init()
+            if mixer_state is None:
+                return
+            self.rate, fmt, self.channels = mixer_state
+            if fmt != -16:  # only signed 16-bit is supported by the generator
+                return
+
+            # short low thud
+            self.bounce = self._make_sound([(220, 110, 0.08, "sine", 0.6)])
+            # rising arpeggio C5 E5 G5 C6
+            self.goal = self._make_sound([
+                (523.25, 523.25, 0.12, "sine", 0.45),
+                (659.25, 659.25, 0.12, "sine", 0.45),
+                (783.99, 783.99, 0.12, "sine", 0.45),
+                (1046.50, 1046.50, 0.30, "sine", 0.45),
+            ])
+            # falling "buzzer"
+            self.timeout = self._make_sound([
+                (440, 440, 0.18, "square", 0.25),
+                (349, 349, 0.18, "square", 0.25),
+                (262, 262, 0.40, "square", 0.25),
+            ])
+            self.enabled = True
+        except pygame.error:
+            self.enabled = False
+
+    def _make_sound(self, notes):
+        samples = array.array("h")
+        for f0, f1, duration, wave, volume in notes:
+            samples.extend(self._tone(f0, f1, duration, wave, volume))
+        return pygame.mixer.Sound(buffer=samples.tobytes())
+
+    def _tone(self, f0, f1, duration, wave, volume):
+        total = max(1, int(self.rate * duration))
+        attack = max(1, int(self.rate * 0.005))
+        out = array.array("h")
+        phase = 0.0
+        for i in range(total):
+            t = i / total
+            freq = f0 + (f1 - f0) * t
+            phase += 2 * math.pi * freq / self.rate
+            s = math.sin(phase)
+            if wave == "square":
+                s = 1.0 if s >= 0 else -1.0
+            envelope = min(1.0, i / attack) * (1.0 - t)
+            value = int(32767 * volume * envelope * s)
+            for _ in range(self.channels):
+                out.append(value)
+        return out
+
+    def play_bounce(self, strength=1.0):
+        """strength is 0..1 and scales the volume."""
+        if not self.enabled:
+            return
+        now = pygame.time.get_ticks()
+        if now - self._last_bounce_ms < self.BOUNCE_COOLDOWN_MS:
+            return
+        self._last_bounce_ms = now
+        self.bounce.set_volume(0.3 + 0.7 * max(0.0, min(1.0, strength)))
+        self.bounce.play()
+
+    def play_goal(self):
+        if self.enabled:
+            self.goal.play()
+
+    def play_timeout(self):
+        if self.enabled:
+            self.timeout.play()
 
 
 class GameEngine:
